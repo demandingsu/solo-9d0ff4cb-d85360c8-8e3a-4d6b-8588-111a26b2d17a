@@ -58,6 +58,43 @@ CREATE TABLE IF NOT EXISTS published_versions (
     png_bytes           INTEGER NOT NULL,
     csv_bytes           INTEGER NOT NULL
 );
+
+-- Per-version provenance index over the published sources.csv.  One row per
+-- version; rows_done is the resume cursor (number of pixel rows committed so
+-- far, always a multiple of the 64-row batch size unless the build finished).
+CREATE TABLE IF NOT EXISTS provenance_indexes (
+    version_id      TEXT PRIMARY KEY,
+    state           TEXT NOT NULL CHECK (state IN ('building', 'ready', 'failed')),
+    canvas_width    INTEGER NOT NULL,
+    canvas_height   INTEGER NOT NULL,
+    rows_done       INTEGER NOT NULL DEFAULT 0,
+    csv_sha256      TEXT NOT NULL,
+    error           TEXT NOT NULL DEFAULT '',
+    updated_at      TEXT NOT NULL
+);
+
+-- Block summaries: the canvas is split into 64x64 pixel blocks from the
+-- top-left corner; edge blocks keep their real width/height.  Each row is the
+-- pixel count one (tile_id, revision) contributed inside one block; the
+-- no-source count is stored as tile_id '' with revision 0.
+CREATE TABLE IF NOT EXISTS provenance_blocks (
+    version_id  TEXT NOT NULL,
+    bx          INTEGER NOT NULL,
+    by          INTEGER NOT NULL,
+    tile_id     TEXT NOT NULL,
+    revision    INTEGER NOT NULL,
+    pixels      INTEGER NOT NULL,
+    PRIMARY KEY (version_id, bx, by, tile_id, revision)
+);
+
+-- Location info: byte offset of each pixel row's first CSV record, so queries
+-- that only partially cover a block can re-read exactly the records they need.
+CREATE TABLE IF NOT EXISTS provenance_row_offsets (
+    version_id  TEXT NOT NULL,
+    y           INTEGER NOT NULL,
+    byte_offset INTEGER NOT NULL,
+    PRIMARY KEY (version_id, y)
+);
 """
 
 DEFAULT_SETTINGS: dict[str, str] = {

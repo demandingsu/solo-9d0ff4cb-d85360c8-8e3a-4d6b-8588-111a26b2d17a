@@ -20,6 +20,7 @@ from fastapi.staticfiles import StaticFiles
 from fastapi.templating import Jinja2Templates
 
 from . import db
+from . import provenance
 from .mosaic import (
     MAX_TILE_ID_LEN,
     TileRecord,
@@ -120,6 +121,15 @@ def create_app(data_dir: str | os.PathLike[str] | None = None) -> FastAPI:
     app.state.db_lock = db_lock
     app.mount("/static", StaticFiles(directory=STATIC_DIR), name="static")
     templates = Jinja2Templates(directory=str(TEMPLATE_DIR))
+
+    # A build that was in flight when the process stopped is not crashed
+    # progress: it resumes from the last committed batch on the next request.
+    with db_lock as conn:
+        provenance.reconcile_interrupted(conn)
+
+    # At most one builder thread per published version.
+    build_threads: dict[str, threading.Thread] = {}
+    build_threads_lock = threading.Lock()
 
     # ------------------------------------------------------------------ #
     # Persistence helpers
@@ -244,6 +254,114 @@ def create_app(data_dir: str | os.PathLike[str] | None = None) -> FastAPI:
     # View helpers
     # ------------------------------------------------------------------ #
 
+    PROV_KEYS = ("prov_version", "prov_x0", "prov_y0", "prov_x1", "prov_y1")
+
+    def run_prov_query(
+        conn, version_id: str, x0_raw: str, y0_raw: str, x1_raw: str, y1_raw: str
+    ) -> dict[str, Any]:
+        """Validate and run a region query; raises provenance.QueryRejected."""
+        try:
+            x0 = validate_int(x0_raw, "左边界 X")
+            y0 = validate_int(y0_raw, "上边界 Y")
+            x1 = validate_int(x1_raw, "右边界 X")
+            y1 = validate_int(y1_raw, "下边界 Y")
+        except TileValidationError as exc:
+            raise provenance.QueryRejected(str(exc)) from None
+        row = conn.execute(
+            "SELECT * FROM published_versions WHERE id = ?", (version_id,)
+        ).fetchone()
+        if row is None:
+            raise provenance.QueryRejected("未找到该发布版本。", 404)
+        width, height = row["canvas_width"], row["canvas_height"]
+        if not (0 <= x0 < x1 <= width and 0 <= y0 < y1 <= height):
+            raise provenance.QueryRejected(
+                f"矩形须满足 0 ≤ 左 < 右 ≤ {width} 且 0 ≤ 上 < 下 ≤ {height}"
+                "（右、下边界不含）。"
+            )
+        index = conn.execute(
+            "SELECT state FROM provenance_indexes WHERE version_id = ?",
+            (version_id,),
+        ).fetchone()
+        if index is None or index["state"] != provenance.STATE_READY:
+            raise provenance.QueryRejected(
+                "该版本的来源索引尚未就绪，请先构建索引。", 409
+            )
+        csv_path = runtime.versions_dir / row["csv_rel"]
+        if not csv_path.is_file():
+            raise provenance.QueryRejected("该版本的来源 CSV 缺失。", 503)
+        try:
+            result = provenance.query_region(
+                conn, csv_path, version_id, width, height, x0, y0, x1, y1
+            )
+        except provenance.ProvenanceError as exc:
+            raise provenance.QueryRejected(str(exc), 409) from None
+        result["version_id"] = version_id
+        result["seq"] = row["seq"]
+        result["rect"] = [x0, y0, x1, y1]
+        return result
+
+    def build_provenance_context(request: Request, conn) -> dict[str, Any]:
+        index_rows = {
+            row["version_id"]: row
+            for row in conn.execute(
+                "SELECT version_id, state, rows_done, canvas_height, error "
+                "FROM provenance_indexes"
+            )
+        }
+        versions = []
+        for row in conn.execute(
+            "SELECT id, seq, created_at, canvas_width, canvas_height, tile_count "
+            "FROM published_versions ORDER BY seq DESC"
+        ):
+            index = index_rows.get(row["id"])
+            state = index["state"] if index else None
+            rows_done = index["rows_done"] if index else 0
+            versions.append(
+                {
+                    "id": row["id"],
+                    "seq": row["seq"],
+                    "created_at": row["created_at"],
+                    "width": row["canvas_width"],
+                    "height": row["canvas_height"],
+                    "tile_count": row["tile_count"],
+                    "index_state": state or "",
+                    "index_label": provenance.status_label(
+                        state, rows_done, row["canvas_height"]
+                    ),
+                    "index_ready": state == provenance.STATE_READY,
+                    "index_started": rows_done > 0,
+                    "index_error": (
+                        (index["error"] if index else "")
+                        if state == provenance.STATE_FAILED
+                        else ""
+                    ),
+                }
+            )
+        params = request.query_params
+        form = {key: params.get(key, "") for key in PROV_KEYS}
+        if not form["prov_version"] and versions:
+            form["prov_version"] = versions[0]["id"]
+        context: dict[str, Any] = {
+            "versions": versions,
+            "form": form,
+            "result": None,
+            "error": "",
+        }
+        if not any(params.get(key) for key in PROV_KEYS):
+            return context
+        try:
+            context["result"] = run_prov_query(
+                conn,
+                form["prov_version"],
+                form["prov_x0"],
+                form["prov_y0"],
+                form["prov_x1"],
+                form["prov_y1"],
+            )
+        except provenance.QueryRejected as exc:
+            context["error"] = str(exc)
+        return context
+
     def build_context(request: Request, conn) -> dict[str, Any]:
         state = read_preview_state(conn)
         tiles = load_tiles(conn)
@@ -303,6 +421,7 @@ def create_app(data_dir: str | os.PathLike[str] | None = None) -> FastAPI:
             "recent_versions": recent,
             "fingerprint": fingerprint,
             "limits": {"max_tile_id_len": MAX_TILE_ID_LEN},
+            "prov": build_provenance_context(request, conn),
             "flash": request.query_params.get("msg", ""),
             "flash_error": request.query_params.get("err", ""),
         }
@@ -314,13 +433,17 @@ def create_app(data_dir: str | os.PathLike[str] | None = None) -> FastAPI:
             request, "index.html", context, status_code=status_code
         )
 
-    def redirect(msg: str | None = None, err: str | None = None) -> RedirectResponse:
+    def redirect(
+        msg: str | None = None, err: str | None = None, anchor: str = ""
+    ) -> RedirectResponse:
         params = []
         if msg:
             params.append("msg=" + quote(msg))
         if err:
             params.append("err=" + quote(err))
         url = "/" + ("?" + "&".join(params) if params else "")
+        if anchor:
+            url += "#" + anchor
         return RedirectResponse(url, status_code=303)
 
     # ------------------------------------------------------------------ #
@@ -744,6 +867,85 @@ def create_app(data_dir: str | os.PathLike[str] | None = None) -> FastAPI:
                 "FROM published_versions ORDER BY seq DESC"
             ).fetchall()
         return JSONResponse([dict(row) for row in rows])
+
+    # ------------------------------------------------------------------ #
+    # Provenance index: build, status, region query
+    # ------------------------------------------------------------------ #
+
+    @app.post("/provenance/build")
+    def build_provenance_index(version: str = Form(...)) -> RedirectResponse:
+        with db_lock as conn:
+            row = conn.execute(
+                "SELECT * FROM published_versions WHERE id = ?", (version,)
+            ).fetchone()
+            index = conn.execute(
+                "SELECT state, rows_done FROM provenance_indexes "
+                "WHERE version_id = ?",
+                (version,),
+            ).fetchone()
+        if row is None:
+            return redirect(err="未找到该发布版本。", anchor="provenance")
+        csv_path = runtime.versions_dir / row["csv_rel"]
+        if not csv_path.is_file():
+            return redirect(
+                err="该版本的来源 CSV 缺失，无法构建索引。", anchor="provenance"
+            )
+        if index is not None and index["state"] == provenance.STATE_READY:
+            return redirect(
+                msg=f"版本 #{row['seq']} 的来源索引已就绪。", anchor="provenance"
+            )
+        with build_threads_lock:
+            thread = build_threads.get(version)
+            if thread is not None and thread.is_alive():
+                return redirect(
+                    msg=f"版本 #{row['seq']} 的来源索引正在构建中。",
+                    anchor="provenance",
+                )
+            thread = threading.Thread(
+                target=provenance.run_build,
+                args=(
+                    db_lock,
+                    csv_path,
+                    row["csv_sha256"],
+                    version,
+                    row["canvas_width"],
+                    row["canvas_height"],
+                ),
+                daemon=True,
+                name=f"provenance-build-{row['seq']}",
+            )
+            build_threads[version] = thread
+            thread.start()
+        resumed = index is not None and index["rows_done"] > 0
+        return redirect(
+            msg=(
+                f"{'继续' if resumed else '开始'}构建版本 #{row['seq']} "
+                "的来源索引。"
+            ),
+            anchor="provenance",
+        )
+
+    @app.get("/provenance/status")
+    def provenance_status() -> JSONResponse:
+        with db_lock as conn:
+            return JSONResponse(provenance.status_map(conn))
+
+    @app.get("/provenance/query")
+    def provenance_query(
+        version: str = "",
+        x0: str = "",
+        y0: str = "",
+        x1: str = "",
+        y1: str = "",
+    ) -> JSONResponse:
+        with db_lock as conn:
+            try:
+                result = run_prov_query(conn, version, x0, y0, x1, y1)
+            except provenance.QueryRejected as exc:
+                raise HTTPException(
+                    status_code=exc.status_code, detail=str(exc)
+                ) from None
+        return JSONResponse(result)
 
     return app
 

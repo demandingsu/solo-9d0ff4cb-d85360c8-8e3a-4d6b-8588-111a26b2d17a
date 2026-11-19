@@ -220,7 +220,147 @@
         </details>
         {% endif %}
       </section>
+
+      <section class="card" id="provenance">
+        <h2>区域来源统计 <span class="hint">发布版本 · 64×64 块索引</span></h2>
+        {% if prov.versions %}
+        <form method="get" action="/">
+          <label class="field"><span>发布版本</span>
+            <select name="prov_version">
+              {% for v in prov.versions %}
+              <option value="{{ v.id }}" {% if prov.form.prov_version == v.id %}selected{% endif %}>
+                #{{ v.seq }} · {{ v.width }}×{{ v.height }} · {{ v.created_at }} · 索引{{ v.index_label }}
+              </option>
+              {% endfor %}
+            </select>
+          </label>
+          <div class="grid2">
+            <label class="field"><span>左 X</span>
+              <input type="number" name="prov_x0" min="0" step="1" required value="{{ prov.form.prov_x0 }}">
+            </label>
+            <label class="field"><span>上 Y</span>
+              <input type="number" name="prov_y0" min="0" step="1" required value="{{ prov.form.prov_y0 }}">
+            </label>
+          </div>
+          <div class="grid2">
+            <label class="field"><span>右 X（不含）</span>
+              <input type="number" name="prov_x1" min="1" step="1" required value="{{ prov.form.prov_x1 }}">
+            </label>
+            <label class="field"><span>下 Y（不含）</span>
+              <input type="number" name="prov_y1" min="1" step="1" required value="{{ prov.form.prov_y1 }}">
+            </label>
+          </div>
+          <div class="actions">
+            <button type="submit" class="primary">统计像素</button>
+            <span class="small muted">矩形为 [左, 右) × [上, 下)，整数坐标，右、下边界不含。</span>
+          </div>
+        </form>
+
+        {% if prov.error %}<div class="flash err" style="margin-top:12px">{{ prov.error }}</div>{% endif %}
+
+        {% if prov.result %}
+        <div class="stats">
+          <span>版本 <b>#{{ prov.result.seq }}</b></span>
+          <span>矩形 <b class="mono">[{{ prov.result.rect[0] }}, {{ prov.result.rect[2] }}) × [{{ prov.result.rect[1] }}, {{ prov.result.rect[3] }})</b></span>
+          <span>总像素 <b>{{ prov.result.total }}</b></span>
+        </div>
+        <table style="margin-top:8px">
+          <thead>
+            <tr><th>瓦片号</th><th class="num">修订</th><th class="num">像素数</th><th class="num">占比</th></tr>
+          </thead>
+          <tbody>
+            {% for row in prov.result.rows %}
+            <tr>
+              <td class="mono">{{ row.tile_id }}</td>
+              <td class="num">r{{ row.revision }}</td>
+              <td class="num">{{ row.pixels }}</td>
+              <td class="num">{{ row.share }}%</td>
+            </tr>
+            {% endfor %}
+            <tr class="inactive">
+              <td>（无来源）</td>
+              <td class="num">—</td>
+              <td class="num">{{ prov.result.no_source }}</td>
+              <td class="num">{{ prov.result.no_source_share }}%</td>
+            </tr>
+          </tbody>
+        </table>
+        {% endif %}
+
+        <details {% if prov.result or prov.error %}open{% endif %} style="margin-top:10px">
+          <summary>来源索引（按版本构建，旧版可补建）</summary>
+          <table>
+            <thead><tr><th>#</th><th class="num">尺寸</th><th>索引状态</th><th></th></tr></thead>
+            <tbody>
+            {% for v in prov.versions %}
+              <tr>
+                <td>{{ v.seq }}</td>
+                <td class="num">{{ v.width }}×{{ v.height }}</td>
+                <td>
+                  <span class="badge {{ 'good' if v.index_ready else ('warn' if v.index_state == 'building' else '') }}"
+                        data-prov-label="{{ v.id }}" data-prov-state="{{ v.index_state }}">{{ v.index_label }}</span>
+                  {% if v.index_error %}<div class="small muted">{{ v.index_error }}</div>{% endif %}
+                </td>
+                <td class="num">
+                  {% if not v.index_ready %}
+                  <form method="post" action="/provenance/build" style="display:inline">
+                    <input type="hidden" name="version" value="{{ v.id }}">
+                    <button type="submit" class="small" {% if v.index_state == 'building' %}disabled{% endif %}>
+                      {{ '继续构建' if v.index_started else '构建索引' }}
+                    </button>
+                  </form>
+                  {% endif %}
+                </td>
+              </tr>
+            {% endfor %}
+            </tbody>
+          </table>
+          <p class="small muted" style="margin:8px 0 0">
+            索引只存 64×64 块汇总与 CSV 行偏移；每批最多处理 64 个像素行并落库，
+            构建失败或服务重启后可从上次进度继续。索引就绪后才能查询。
+          </p>
+        </details>
+        {% else %}
+        <p class="muted small">尚未发布版本。发布后可为任意版本（含旧版）构建来源索引，并统计矩形内各瓦片贡献的像素。</p>
+        {% endif %}
+      </section>
     </div>
   </main>
+  {% if prov.versions %}
+  <script>
+  (function () {
+    const nodes = document.querySelectorAll("[data-prov-label]");
+    if (!nodes.length) return;
+    let anyBuilding = false;
+    nodes.forEach((el) => {
+      if (el.getAttribute("data-prov-state") === "building") anyBuilding = true;
+    });
+    async function poll() {
+      let again = false, becameTerminal = false;
+      try {
+        const resp = await fetch("/provenance/status", { cache: "no-store" });
+        if (!resp.ok) return;
+        const data = await resp.json();
+        nodes.forEach((el) => {
+          const info = data[el.getAttribute("data-prov-label")];
+          if (!info) return;
+          if (el.getAttribute("data-prov-state") === "building" && info.state !== "building") {
+            becameTerminal = true;
+          }
+          el.textContent = info.label;
+          el.setAttribute("data-prov-state", info.state);
+          if (info.state === "building") again = true;
+        });
+      } catch (err) {
+        again = true;
+      }
+      // 构建结束时刷新一次，让按钮与“就绪”状态更新。
+      if (becameTerminal) { location.reload(); return; }
+      if (again) setTimeout(poll, 1500);
+    }
+    if (anyBuilding) setTimeout(poll, 1200);
+  })();
+  </script>
+  {% endif %}
 </body>
 </html>
